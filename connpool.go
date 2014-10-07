@@ -24,8 +24,9 @@ type Pool struct {
 	// Dial: specifies the function used to create new connections
 	Dial DialFunc
 
-	conns []*pooledConn
-	mutex sync.Mutex
+	stopped bool
+	conns   []*pooledConn
+	mutex   sync.Mutex
 }
 
 // Start starts the pool, filling it to the MinSize and maintaining the
@@ -35,14 +36,25 @@ func (p *Pool) Start() {
 		p.ClaimTimeout = DefaultClaimTimeout
 	}
 	p.conns = make([]*pooledConn, 0)
-	p.maintain()
-	go func() {
-		// Periodically call maintain
-		for {
-			time.Sleep(1 * time.Second)
-			p.maintain()
-		}
-	}()
+	if p.MinSize > 0 {
+		// If we're actually pooling stuff, periodically call maintain to
+		// maintain the pool.
+		go func() {
+			for {
+				if p.maintain() {
+					// We've stopped, exit loop
+					return
+				}
+				time.Sleep(1 * time.Second)
+			}
+		}()
+	}
+}
+
+func (p *Pool) Stop() {
+	p.mutex.Lock()
+	p.stopped = true
+	p.mutex.Unlock()
 }
 
 func (p *Pool) Get() (net.Conn, error) {
@@ -66,10 +78,19 @@ func (p *Pool) Get() (net.Conn, error) {
 // maintain maintains the pool, making sure that connections that are about to
 // time out are replaced with new connections and that connections are sorted
 // based on which are timing out soonest.
-func (p *Pool) maintain() {
+func (p *Pool) maintain() (stopped bool) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	p.doMaintain()
+	if !p.stopped {
+		p.doMaintain()
+	} else {
+		// Close any lingering connections
+		for _, conn := range p.conns {
+			conn.Close()
+		}
+		p.conns = make([]*pooledConn, 0)
+	}
+	return p.stopped
 }
 
 func (p *Pool) doMaintain() {
@@ -79,6 +100,9 @@ func (p *Pool) doMaintain() {
 		if conn.expires.After(expiresThreshold) {
 			// keep conn
 			newConns = append(newConns, conn)
+		} else {
+			// close expired conn
+			conn.Close()
 		}
 	}
 	sort.Sort(byExpiration(newConns))

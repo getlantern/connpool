@@ -1,18 +1,15 @@
 package connpool
 
 import (
-	"log"
 	"net"
 	"sort"
 	"sync"
 	"time"
-
-	"github.com/getlantern/idletiming"
 )
 
 const (
-	DefaultIdleTimeout = 10 * time.Minute
-	TimeoutThreshold   = 1 * time.Second
+	DefaultClaimTimeout = 10 * time.Minute
+	TimeoutThreshold    = 1 * time.Second
 )
 
 type DialFunc func() (net.Conn, error)
@@ -21,9 +18,9 @@ type Pool struct {
 	// MinSize: the pool will always attempt to maintain at least these many
 	// connections.
 	MinSize int
-	// IdleTimeout: connections will be removed from pool if idle for longer
-	// than IdleTimeout.  The default IdleTimeout is 10 minutes.
-	IdleTimeout time.Duration
+	// ClaimTimeout: connections will be removed from pool if unclaimed for
+	// longer than ClaimTimeout.  The default ClaimTimeout is 10 minutes.
+	ClaimTimeout time.Duration
 	// Dial: specifies the function used to create new connections
 	Dial DialFunc
 
@@ -34,9 +31,8 @@ type Pool struct {
 // Start starts the pool, filling it to the MinSize and maintaining the
 // connections.
 func (p *Pool) Start() {
-	log.Println("Starting connection pool")
-	if p.IdleTimeout == 0 {
-		p.IdleTimeout = DefaultIdleTimeout
+	if p.ClaimTimeout == 0 {
+		p.ClaimTimeout = DefaultClaimTimeout
 	}
 	p.conns = make([]*pooledConn, 0)
 	p.maintain()
@@ -51,9 +47,10 @@ func (p *Pool) Start() {
 
 func (p *Pool) Get() (net.Conn, error) {
 	p.mutex.Lock()
+	// Look for an unexpired pooled connection
 	for i, conn := range p.conns {
-		if conn.conn.TimesOutIn() > TimeoutThreshold {
-			log.Println("Using pooled connection")
+		if conn.expires.After(time.Now()) {
+			// Use pooled connection
 			p.removeAt(i)
 			p.doMaintain()
 			p.mutex.Unlock()
@@ -63,7 +60,6 @@ func (p *Pool) Get() (net.Conn, error) {
 
 	// No pooled conn, dial our own
 	p.mutex.Unlock()
-	log.Println("Using new connection")
 	return p.dial()
 }
 
@@ -78,32 +74,28 @@ func (p *Pool) maintain() {
 
 func (p *Pool) doMaintain() {
 	newConns := make([]*pooledConn, 0)
+	expiresThreshold := time.Now().Add(-1 * TimeoutThreshold)
 	for _, conn := range p.conns {
-		if conn.conn.TimesOutIn() > TimeoutThreshold {
+		if conn.expires.After(expiresThreshold) {
 			// keep conn
 			newConns = append(newConns, conn)
-		} else {
-			log.Println("Removing timed out connection")
 		}
 	}
-	sort.Sort(byTimeout(newConns))
+	sort.Sort(byExpiration(newConns))
 	p.conns = newConns
 
 	// Add connections to get pool up to the MinSize
 	connsNeeded := p.MinSize - len(p.conns)
-	if connsNeeded > 0 {
-		log.Printf("Adding %d connections to pool", connsNeeded)
-		for i := 0; i < connsNeeded; i++ {
-			go func() {
-				for {
-					c, err := p.dial()
-					if err == nil {
-						p.add(c, false)
-						return
-					}
+	for i := 0; i < connsNeeded; i++ {
+		go func() {
+			for {
+				c, err := p.dial()
+				if err == nil {
+					p.add(c, false)
+					return
 				}
-			}()
-		}
+			}
+		}()
 	}
 }
 
@@ -124,18 +116,19 @@ func (p *Pool) removeAt(i int) {
 }
 
 func (p *Pool) dial() (*pooledConn, error) {
+	expires := time.Now().Add(p.ClaimTimeout)
 	c, err := p.Dial()
 	if err != nil {
 		return nil, err
 	} else {
-		conn := &pooledConn{p, idletiming.Conn(c, p.IdleTimeout, nil)}
+		conn := &pooledConn{c, expires}
 		return conn, nil
 	}
 }
 
 type pooledConn struct {
-	pool *Pool
-	conn *idletiming.IdleTimingConn
+	conn    net.Conn
+	expires time.Time
 }
 
 func (c *pooledConn) Read(b []byte) (int, error) {
@@ -171,8 +164,8 @@ func (c *pooledConn) SetWriteDeadline(t time.Time) error {
 	return c.conn.SetWriteDeadline(t)
 }
 
-type byTimeout []*pooledConn
+type byExpiration []*pooledConn
 
-func (a byTimeout) Len() int           { return len(a) }
-func (a byTimeout) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byTimeout) Less(i, j int) bool { return a[i].conn.TimesOutAt().Before(a[j].conn.TimesOutAt()) }
+func (a byExpiration) Len() int           { return len(a) }
+func (a byExpiration) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a byExpiration) Less(i, j int) bool { return a[i].expires.Before(a[j].expires) }

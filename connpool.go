@@ -40,27 +40,30 @@ func (p *Pool) Start() {
 	}
 	p.conns = make([]*pooledConn, 0)
 	p.maintain()
+	go func() {
+		// Periodically call maintain
+		for {
+			time.Sleep(1 * time.Second)
+			p.maintain()
+		}
+	}()
 }
 
 func (p *Pool) Get() (net.Conn, error) {
 	p.mutex.Lock()
-	for _, conn := range p.conns {
+	for i, conn := range p.conns {
 		if conn.conn.TimesOutIn() > TimeoutThreshold {
 			log.Println("Using pooled connection")
-			// There are pooled conns, grab the first one
-			conn := p.conns[0]
-			oldConns := p.conns
-			p.conns = make([]*pooledConn, len(oldConns)-1)
-			copy(p.conns, oldConns[1:])
+			p.removeAt(i)
 			p.doMaintain()
 			p.mutex.Unlock()
 			return conn, nil
 		}
 	}
 
-	log.Println("Using new connection")
 	// No pooled conn, dial our own
 	p.mutex.Unlock()
+	log.Println("Using new connection")
 	return p.dial()
 }
 
@@ -69,7 +72,7 @@ func (p *Pool) Get() (net.Conn, error) {
 // based on which are timing out soonest.
 func (p *Pool) maintain() {
 	p.mutex.Lock()
-	p.mutex.Unlock()
+	defer p.mutex.Unlock()
 	p.doMaintain()
 }
 
@@ -106,25 +109,18 @@ func (p *Pool) doMaintain() {
 
 func (p *Pool) add(conn *pooledConn, maintain bool) {
 	p.mutex.Lock()
-	p.mutex.Unlock()
+	defer p.mutex.Unlock()
 	p.conns = append(p.conns, conn)
 	if maintain {
 		p.doMaintain()
 	}
 }
 
-func (p *Pool) remove(conn *pooledConn) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	for i, c := range p.conns {
-		if c == conn {
-			oldConns := p.conns
-			p.conns = make([]*pooledConn, len(oldConns)-1)
-			copy(p.conns, oldConns[:i])
-			copy(p.conns[i:], oldConns[i+1:])
-			return
-		}
-	}
+func (p *Pool) removeAt(i int) {
+	oldConns := p.conns
+	p.conns = make([]*pooledConn, len(oldConns)-1)
+	copy(p.conns, oldConns[:i])
+	copy(p.conns[i:], oldConns[i+1:])
 }
 
 func (p *Pool) dial() (*pooledConn, error) {
@@ -132,10 +128,7 @@ func (p *Pool) dial() (*pooledConn, error) {
 	if err != nil {
 		return nil, err
 	} else {
-		conn := &pooledConn{pool: p}
-		conn.conn = idletiming.Conn(c, p.IdleTimeout, func() {
-			p.remove(conn)
-		})
+		conn := &pooledConn{p, idletiming.Conn(c, p.IdleTimeout, nil)}
 		return conn, nil
 	}
 }
@@ -155,9 +148,7 @@ func (c *pooledConn) Write(b []byte) (int, error) {
 }
 
 func (c *pooledConn) Close() error {
-	log.Println("Returning connection to pool")
-	c.pool.add(c, true)
-	return nil
+	return c.conn.Close()
 }
 
 func (c *pooledConn) LocalAddr() net.Addr {

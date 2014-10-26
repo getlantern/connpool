@@ -55,6 +55,8 @@ func (p *Pool) Start() {
 	}
 }
 
+// Stop stops the goroutines that are filling the pool, blocking until they've
+// all temrinated.
 func (p *Pool) Stop() {
 	p.log.Trace("Stopping all feedConn goroutines")
 	var wg sync.WaitGroup

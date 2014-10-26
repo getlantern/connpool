@@ -21,7 +21,7 @@ var (
 
 func TestIt(t *testing.T) {
 	poolSize := 20
-	claimTimeout := 10 * time.Second
+	claimTimeout := 1 * time.Second
 	fillTime := 100 * time.Millisecond
 
 	addr, err := startTestServer()
@@ -51,7 +51,13 @@ func TestIt(t *testing.T) {
 	openConns = countOpenFiles() - fdCountStart
 	assert.Equal(t, poolSize, openConns, "Pool should fill itself back up to the right number of conns")
 
-	time.Sleep(fillTime * 3)
+	// Wait for connections to time out
+	time.Sleep(claimTimeout * 2)
+
+	// Test our connections again
+	connectAndRead(t, p, poolSize*2)
+
+	time.Sleep(fillTime)
 	openConns = countOpenFiles() - fdCountStart
 	assert.Equal(t, poolSize, openConns, "After pooled conns time out, pool should fill itself back up to the right number of conns")
 

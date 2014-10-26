@@ -72,6 +72,9 @@ func (p *Pool) Get() (net.Conn, error) {
 			if pc.expires.After(time.Now()) {
 				p.log.Trace("Using pooled conn")
 				return pc.conn, nil
+			} else {
+				p.log.Trace("Closing expired conn")
+				pc.conn.Close()
 			}
 		default:
 			p.log.Trace("No pooled conn, dialing our own")

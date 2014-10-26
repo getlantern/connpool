@@ -105,9 +105,9 @@ func (p *Pool) feedConn() {
 
 		select {
 		case p.connCh <- pc:
-			p.log.Trace("Queued conn")
+			p.log.Trace("Fed conn")
 		case <-newConnTimedOut.C:
-			p.log.Trace("New conn timed out, closing")
+			p.log.Trace("Queued conn timed out, closing")
 			pc.conn.Close()
 		case <-p.stopCh:
 			// Close unqueued conn

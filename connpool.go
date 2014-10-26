@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/getlantern/conncheck"
 	"github.com/getlantern/golog"
 )
 
@@ -78,7 +79,7 @@ func (p *Pool) Get() (net.Conn, error) {
 		select {
 		case pc := <-p.connCh:
 			p.log.Trace("Looking for an unexpired pooled conn")
-			if pc.expires.After(time.Now()) {
+			if pc.isValid() {
 				p.log.Trace("Using pooled conn")
 				return pc.conn, nil
 			} else {
@@ -152,4 +153,12 @@ func (p *Pool) dial() (*pooledConn, error) {
 type pooledConn struct {
 	conn    net.Conn
 	expires time.Time
+}
+
+func (pc *pooledConn) isValid() bool {
+	return !pc.isExpired() && conncheck.IsOpen(pc.conn)
+}
+
+func (pc *pooledConn) isExpired() bool {
+	return !pc.expires.After(time.Now())
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
@@ -60,6 +61,19 @@ func TestIt(t *testing.T) {
 	time.Sleep(fillTime)
 	openConns = countOpenFiles() - fdCountStart
 	assert.Equal(t, poolSize, openConns, "After pooled conns time out, pool should fill itself back up to the right number of conns")
+
+	// Make a dial function that randomly returns closed connections
+	p.Dial = func() (net.Conn, error) {
+		conn, err := net.DialTimeout("tcp", addr, 15*time.Millisecond)
+		// Close about half of the connections immediately to test closed checking
+		if err == nil && rand.Float32() > 0.5 {
+			conn.Close()
+		}
+		return conn, err
+	}
+
+	// Make sure we can still get connections and use them
+	connectAndRead(t, p, poolSize)
 
 	p.Stop()
 	time.Sleep(2 * time.Second)

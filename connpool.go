@@ -5,6 +5,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/getlantern/golog"
 )
 
 const (
@@ -18,33 +20,51 @@ type Pool struct {
 	// MinSize: the pool will always attempt to maintain at least these many
 	// connections.
 	MinSize int
+
 	// ClaimTimeout: connections will be removed from pool if unclaimed for
 	// longer than ClaimTimeout.  The default ClaimTimeout is 10 minutes.
 	ClaimTimeout time.Duration
+
 	// Dial: specifies the function used to create new connections
 	Dial DialFunc
 
-	stopped bool
-	conns   []*pooledConn
-	mutex   sync.Mutex
+	stopped           bool
+	log               golog.Logger
+	conns             []*pooledConn
+	mutex             sync.Mutex
+	maintainRequested chan interface{}
 }
 
 // Start starts the pool, filling it to the MinSize and maintaining the
 // connections.
 func (p *Pool) Start() {
+	p.log = golog.LoggerFor("connpool")
+
+	p.log.Trace("Starting connection pool")
 	if p.ClaimTimeout == 0 {
+		p.log.Tracef("Defaulting ClaimTimeout to %s", DefaultClaimTimeout)
 		p.ClaimTimeout = DefaultClaimTimeout
 	}
+
 	p.conns = make([]*pooledConn, 0)
-	if p.MinSize > 0 {
-		// If we're actually pooling stuff, periodically call maintain to
-		// maintain the pool.
-		go func() {
-			for {
+	p.maintainRequested = make(chan interface{}, p.MinSize*10)
+	go func() {
+		for {
+			<-p.maintainRequested
+			if p.MinSize > 0 {
+				p.log.Trace("We're pooling stuff, call maintain")
 				if p.maintain() {
-					// We've stopped, exit loop
+					p.log.Trace("We've stopped, exiting maintain loop")
 					return
 				}
+			}
+		}
+	}()
+	if p.MinSize > 0 {
+		p.log.Trace("We're pooling stuff, periodically request maintain")
+		go func() {
+			for {
+				p.requestMaintain()
 				time.Sleep(1 * time.Second)
 			}
 		}()
@@ -52,27 +72,39 @@ func (p *Pool) Start() {
 }
 
 func (p *Pool) Stop() {
+	p.log.Trace("Stopping connection pool")
 	p.mutex.Lock()
 	p.stopped = true
 	p.mutex.Unlock()
 }
 
 func (p *Pool) Get() (net.Conn, error) {
+	p.log.Trace("Getting conn from pool")
 	p.mutex.Lock()
+	p.log.Trace("Looking for an unexpired pooled conn")
 	// Look for an unexpired pooled connection
 	for i, conn := range p.conns {
 		if conn.expires.After(time.Now()) {
-			// Use pooled connection
+			p.log.Trace("Using pooled conn")
 			p.removeAt(i)
-			p.doMaintain()
+			p.requestMaintain()
 			p.mutex.Unlock()
 			return conn, nil
 		}
 	}
 
-	// No pooled conn, dial our own
+	p.log.Trace("No pooled conn, dialing our own")
 	p.mutex.Unlock()
 	return p.dial()
+}
+
+func (p *Pool) requestMaintain() {
+	select {
+	case p.maintainRequested <- nil:
+		p.log.Trace("Maintain request accepted")
+	default:
+		p.log.Trace("Maintain request channel full, ignore request")
+	}
 }
 
 // maintain maintains the pool, making sure that connections that are about to
@@ -84,7 +116,7 @@ func (p *Pool) maintain() (stopped bool) {
 	if !p.stopped {
 		p.doMaintain()
 	} else {
-		// Close any lingering connections
+		p.log.Trace("Pool stopped, close any lingering connections")
 		for _, conn := range p.conns {
 			conn.Close()
 		}
@@ -98,38 +130,40 @@ func (p *Pool) doMaintain() {
 	expiresThreshold := time.Now().Add(-1 * TimeoutThreshold)
 	for _, conn := range p.conns {
 		if conn.expires.After(expiresThreshold) {
-			// keep conn
+			p.log.Trace("Keeping unexpired conn")
 			newConns = append(newConns, conn)
 		} else {
-			// close expired conn
+			p.log.Trace("Closing expired conn")
 			conn.Close()
 		}
 	}
 	sort.Sort(byExpiration(newConns))
 	p.conns = newConns
 
-	// Add connections to get pool up to the MinSize
 	connsNeeded := p.MinSize - len(p.conns)
+	var wg sync.WaitGroup
+	wg.Add(connsNeeded)
+	p.log.Tracef("Adding %d connections to get pool up to the MinSize", connsNeeded)
 	for i := 0; i < connsNeeded; i++ {
 		go func() {
-			for {
+			defer wg.Done()
+			for j := 0; j < 3; j++ {
+				if j > 0 {
+					p.log.Trace("Dial failed, retrying")
+				}
 				c, err := p.dial()
 				if err == nil {
-					p.add(c, false)
+					p.conns = append(p.conns, c)
+					p.log.Trace("Dialed successfully")
 					return
+				} else {
+					p.log.Tracef("Error dialing: %s", err)
 				}
 			}
 		}()
 	}
-}
-
-func (p *Pool) add(conn *pooledConn, maintain bool) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	p.conns = append(p.conns, conn)
-	if maintain {
-		p.doMaintain()
-	}
+	wg.Wait()
+	p.log.Trace("Done with maintain")
 }
 
 func (p *Pool) removeAt(i int) {

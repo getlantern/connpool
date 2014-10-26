@@ -5,7 +5,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/getlantern/conncheck"
 	"github.com/getlantern/golog"
 )
 
@@ -33,7 +32,7 @@ type Pool struct {
 	Dial DialFunc
 
 	log    golog.Logger
-	connCh chan *pooledConn
+	connCh chan net.Conn
 	stopCh chan *sync.WaitGroup
 }
 
@@ -48,7 +47,7 @@ func (p *Pool) Start() {
 		p.ClaimTimeout = DefaultClaimTimeout
 	}
 
-	p.connCh = make(chan *pooledConn)
+	p.connCh = make(chan net.Conn)
 	p.stopCh = make(chan *sync.WaitGroup, p.MinSize)
 
 	for i := 0; i < p.MinSize; i++ {
@@ -77,22 +76,12 @@ func (p *Pool) Get() (net.Conn, error) {
 	p.log.Trace("Getting conn")
 	for {
 		select {
-		case pc := <-p.connCh:
-			p.log.Trace("Looking for an unexpired pooled conn")
-			if pc.isValid() {
-				p.log.Trace("Using pooled conn")
-				return pc.conn, nil
-			} else {
-				p.log.Trace("Closing expired pooled conn")
-				pc.conn.Close()
-			}
+		case conn := <-p.connCh:
+			p.log.Trace("Using pooled conn")
+			return conn, nil
 		default:
 			p.log.Trace("No pooled conn, dialing our own")
-			pc, err := p.dial()
-			if err != nil {
-				return nil, err
-			}
-			return pc.conn, nil
+			return p.Dial()
 		}
 	}
 }
@@ -103,7 +92,7 @@ func (p *Pool) feedConn() {
 
 	for {
 		p.log.Trace("Dialing")
-		pc, err := p.dial()
+		conn, err := p.Dial()
 		if err != nil {
 			p.log.Tracef("Error dialing: %s", err)
 			continue
@@ -111,22 +100,22 @@ func (p *Pool) feedConn() {
 		newConnTimedOut.Reset(p.ClaimTimeout)
 
 		select {
-		case p.connCh <- pc:
+		case p.connCh <- conn:
 			p.log.Trace("Fed conn")
 		case <-newConnTimedOut.C:
 			p.log.Trace("Queued conn timed out, closing")
-			pc.conn.Close()
+			conn.Close()
 		case wg := <-p.stopCh:
 			p.log.Trace("Stopping")
-			p.log.Trace("Closing unqueued conn")
-			pc.conn.Close()
+			p.log.Trace("Closing queued conn")
+			conn.Close()
 			p.log.Trace("Closing all queued conns")
 		CloseLoop:
 			for {
 				select {
-				case pc := <-p.connCh:
+				case conn := <-p.connCh:
 					p.log.Trace("Closing conn from pool")
-					pc.conn.Close()
+					conn.Close()
 				default:
 					p.log.Trace("No more queued conns to close")
 					break CloseLoop
@@ -137,28 +126,4 @@ func (p *Pool) feedConn() {
 			return
 		}
 	}
-}
-
-func (p *Pool) dial() (*pooledConn, error) {
-	expires := time.Now().Add(p.ClaimTimeout)
-	c, err := p.Dial()
-	if err != nil {
-		return nil, err
-	} else {
-		conn := &pooledConn{c, expires}
-		return conn, nil
-	}
-}
-
-type pooledConn struct {
-	conn    net.Conn
-	expires time.Time
-}
-
-func (pc *pooledConn) isValid() bool {
-	return !pc.isExpired() && conncheck.IsOpen(pc.conn)
-}
-
-func (pc *pooledConn) isExpired() bool {
-	return !pc.expires.After(time.Now())
 }

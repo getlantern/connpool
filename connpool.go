@@ -2,6 +2,7 @@ package connpool
 
 import (
 	"net"
+	"sync"
 	"time"
 
 	"github.com/getlantern/golog"
@@ -32,7 +33,7 @@ type Pool struct {
 
 	log    golog.Logger
 	connCh chan *pooledConn
-	stopCh chan interface{}
+	stopCh chan *sync.WaitGroup
 }
 
 // Start starts the pool, filling it to the MinSize and maintaining fresh
@@ -47,7 +48,7 @@ func (p *Pool) Start() {
 	}
 
 	p.connCh = make(chan *pooledConn)
-	p.stopCh = make(chan interface{}, p.MinSize)
+	p.stopCh = make(chan *sync.WaitGroup, p.MinSize)
 
 	for i := 0; i < p.MinSize; i++ {
 		go p.feedConn()
@@ -56,14 +57,17 @@ func (p *Pool) Start() {
 
 func (p *Pool) Stop() {
 	p.log.Trace("Stopping all feedConn goroutines")
+	var wg sync.WaitGroup
+	wg.Add(p.MinSize)
 	for i := 0; i < p.MinSize; i++ {
 		select {
-		case p.stopCh <- nil:
+		case p.stopCh <- &wg:
 			p.log.Trace("Stop requested")
 		default:
 			p.log.Trace("Stop previously requested")
 		}
 	}
+	wg.Wait()
 }
 
 func (p *Pool) Get() (net.Conn, error) {
@@ -109,19 +113,24 @@ func (p *Pool) feedConn() {
 		case <-newConnTimedOut.C:
 			p.log.Trace("Queued conn timed out, closing")
 			pc.conn.Close()
-		case <-p.stopCh:
-			// Close unqueued conn
+		case wg := <-p.stopCh:
+			p.log.Trace("Stopping")
+			p.log.Trace("Closing unqueued conn")
 			pc.conn.Close()
-			// Close all queued conns
+			p.log.Trace("Closing all queued conns")
+		CloseLoop:
 			for {
 				select {
 				case pc := <-p.connCh:
+					p.log.Trace("Closing conn from pool")
 					pc.conn.Close()
 				default:
-					break
+					p.log.Trace("No more queued conns to close")
+					break CloseLoop
 				}
 			}
 			p.log.Trace("Stopped feeding conn")
+			(*wg).Done()
 			return
 		}
 	}

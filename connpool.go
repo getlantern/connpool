@@ -14,6 +14,10 @@ const (
 
 type DialFunc func() (net.Conn, error)
 
+// Pool is a pool of connections.  Connections are pooled eagerly up to MinSize
+// and expire after ClaimTimeout.  Pool attempts to always have MinSize
+// unexpired connections ready to go so that callers don't have to wait on a
+// connection being established when they're ready to use it.
 type Pool struct {
 	// MinSize: the pool will always attempt to maintain at least these many
 	// connections.
@@ -31,7 +35,7 @@ type Pool struct {
 	stopCh chan interface{}
 }
 
-// Start starts the pool, filling it to the MinSize and maintaining the
+// Start starts the pool, filling it to the MinSize and maintaining fresh
 // connections.
 func (p *Pool) Start() {
 	p.log = golog.LoggerFor("connpool")
@@ -42,29 +46,28 @@ func (p *Pool) Start() {
 		p.ClaimTimeout = DefaultClaimTimeout
 	}
 
-	// Size the channel of conns to be 1 less than the min pool size, since
-	// there will always be 1 conn that's dialed and waiting to be enqueued.
-	channelSize := p.MinSize - 1
-	if channelSize < 0 {
-		channelSize = 0
-	}
-	p.connCh = make(chan *pooledConn, channelSize)
-	p.stopCh = make(chan interface{})
+	p.connCh = make(chan *pooledConn)
+	p.stopCh = make(chan interface{}, p.MinSize)
 
-	go p.process()
+	for i := 0; i < p.MinSize; i++ {
+		go p.feedConn()
+	}
 }
 
 func (p *Pool) Stop() {
-	select {
-	case p.stopCh <- nil:
-		p.log.Trace("Stop requested")
-	default:
-		p.log.Trace("Stop previously requested")
+	p.log.Trace("Stopping all feedConn goroutines")
+	for i := 0; i < p.MinSize; i++ {
+		select {
+		case p.stopCh <- nil:
+			p.log.Trace("Stop requested")
+		default:
+			p.log.Trace("Stop previously requested")
+		}
 	}
 }
 
 func (p *Pool) Get() (net.Conn, error) {
-	p.log.Trace("Getting conn from pool")
+	p.log.Trace("Getting conn")
 	for {
 		select {
 		case pc := <-p.connCh:
@@ -73,7 +76,7 @@ func (p *Pool) Get() (net.Conn, error) {
 				p.log.Trace("Using pooled conn")
 				return pc.conn, nil
 			} else {
-				p.log.Trace("Closing expired conn")
+				p.log.Trace("Closing expired pooled conn")
 				pc.conn.Close()
 			}
 		default:
@@ -87,8 +90,10 @@ func (p *Pool) Get() (net.Conn, error) {
 	}
 }
 
-// process is the run loop for the Pool
-func (p *Pool) process() {
+// feedConn works on continuously feeding the connCh with fresh connections.
+func (p *Pool) feedConn() {
+	newConnTimedOut := time.NewTimer(0)
+
 	for {
 		p.log.Trace("Dialing")
 		pc, err := p.dial()
@@ -96,9 +101,14 @@ func (p *Pool) process() {
 			p.log.Tracef("Error dialing: %s", err)
 			continue
 		}
+		newConnTimedOut.Reset(p.ClaimTimeout)
+
 		select {
 		case p.connCh <- pc:
 			p.log.Trace("Queued conn")
+		case <-newConnTimedOut.C:
+			p.log.Trace("New conn timed out, closing")
+			pc.conn.Close()
 		case <-p.stopCh:
 			// Close unqueued conn
 			pc.conn.Close()
@@ -111,7 +121,7 @@ func (p *Pool) process() {
 					break
 				}
 			}
-			p.log.Trace("Stopped")
+			p.log.Trace("Stopped feeding conn")
 			return
 		}
 	}

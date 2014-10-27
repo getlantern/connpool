@@ -40,6 +40,9 @@ func TestIt(t *testing.T) {
 	fdCountStart := countOpenFiles()
 
 	p.Start()
+	// Run another Start() concurrently just to make sure it doesn't much things up
+	go p.Start()
+
 	time.Sleep(fillTime)
 
 	openConns := countOpenFiles() - fdCountStart
@@ -76,10 +79,11 @@ func TestIt(t *testing.T) {
 	connectAndRead(t, p, poolSize)
 
 	p.Stop()
-	time.Sleep(2 * time.Second)
+	// Run another Stop() concurrently just to make sure it doesn't muck things up
+	go p.Stop()
 
 	openConns = countOpenFiles() - fdCountStart
-	assert.Equal(t, 0, openConns, "After stopping pool and allowing it to quiesce, there should be no more open conns")
+	assert.Equal(t, 0, openConns, "After stopping pool, there should be no more open conns")
 }
 
 func connectAndRead(t *testing.T, p *Pool, loops int) {

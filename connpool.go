@@ -31,15 +31,26 @@ type Pool struct {
 	// Dial: specifies the function used to create new connections
 	Dial DialFunc
 
-	log    golog.Logger
-	connCh chan net.Conn
-	stopCh chan *sync.WaitGroup
+	log        golog.Logger
+	runMutex   sync.Mutex
+	running    bool
+	actualSize int
+	connCh     chan net.Conn
+	stopCh     chan *sync.WaitGroup
 }
 
 // Start starts the pool, filling it to the MinSize and maintaining fresh
 // connections.
 func (p *Pool) Start() {
+	p.runMutex.Lock()
+	defer p.runMutex.Unlock()
+
 	p.log = golog.LoggerFor("connpool")
+
+	if p.running {
+		p.log.Trace("Already running, ignoring additional Start() call")
+		return
+	}
 
 	p.log.Trace("Starting connection pool")
 	if p.ClaimTimeout == 0 {
@@ -50,26 +61,35 @@ func (p *Pool) Start() {
 	p.connCh = make(chan net.Conn)
 	p.stopCh = make(chan *sync.WaitGroup, p.MinSize)
 
-	for i := 0; i < p.MinSize; i++ {
+	p.log.Tracef("Remembering actual size %d in case MinSize is later changed", p.MinSize)
+	p.actualSize = p.MinSize
+	for i := 0; i < p.actualSize; i++ {
 		go p.feedConn()
 	}
+
+	p.running = true
 }
 
 // Stop stops the goroutines that are filling the pool, blocking until they've
-// all temrinated.
+// all terminated.
 func (p *Pool) Stop() {
+	p.runMutex.Lock()
+	defer p.runMutex.Unlock()
+
+	if !p.running {
+		p.log.Trace("Not running, ignoring Stop() call")
+		return
+	}
+
 	p.log.Trace("Stopping all feedConn goroutines")
 	var wg sync.WaitGroup
-	wg.Add(p.MinSize)
-	for i := 0; i < p.MinSize; i++ {
-		select {
-		case p.stopCh <- &wg:
-			p.log.Trace("Stop requested")
-		default:
-			p.log.Trace("Stop previously requested")
-		}
+	wg.Add(p.actualSize)
+	for i := 0; i < p.actualSize; i++ {
+		p.stopCh <- &wg
 	}
 	wg.Wait()
+
+	p.running = false
 }
 
 func (p *Pool) Get() (net.Conn, error) {
@@ -102,24 +122,16 @@ func (p *Pool) feedConn() {
 			p.log.Trace("Fed conn")
 		case <-newConnTimedOut.C:
 			p.log.Trace("Queued conn timed out, closing")
-			conn.Close()
-		case wg := <-p.stopCh:
-			p.log.Trace("Stopping")
-			p.log.Trace("Closing queued conn")
-			conn.Close()
-			p.log.Trace("Closing all queued conns")
-		CloseLoop:
-			for {
-				select {
-				case conn := <-p.connCh:
-					p.log.Trace("Closing conn from pool")
-					conn.Close()
-				default:
-					p.log.Trace("No more queued conns to close")
-					break CloseLoop
-				}
+			err := conn.Close()
+			if err != nil {
+				p.log.Tracef("Unable to close timed out queued conn: %s", err)
 			}
-			p.log.Trace("Stopped feeding conn")
+		case wg := <-p.stopCh:
+			p.log.Trace("Closing queued conn")
+			err := conn.Close()
+			if err != nil {
+				p.log.Tracef("Unable to close queued conn: %s", err)
+			}
 			(*wg).Done()
 			return
 		}

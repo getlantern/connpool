@@ -2,9 +2,10 @@ package connpool
 
 import (
 	"net"
-	"sort"
 	"sync"
 	"time"
+
+	"github.com/getlantern/golog"
 )
 
 const (
@@ -14,182 +15,125 @@ const (
 
 type DialFunc func() (net.Conn, error)
 
+// Pool is a pool of connections.  Connections are pooled eagerly up to MinSize
+// and expire after ClaimTimeout.  Pool attempts to always have MinSize
+// unexpired connections ready to go so that callers don't have to wait on a
+// connection being established when they're ready to use it.
 type Pool struct {
 	// MinSize: the pool will always attempt to maintain at least these many
 	// connections.
 	MinSize int
+
 	// ClaimTimeout: connections will be removed from pool if unclaimed for
 	// longer than ClaimTimeout.  The default ClaimTimeout is 10 minutes.
 	ClaimTimeout time.Duration
+
 	// Dial: specifies the function used to create new connections
 	Dial DialFunc
 
-	stopped bool
-	conns   []*pooledConn
-	mutex   sync.Mutex
+	log        golog.Logger
+	runMutex   sync.Mutex
+	running    bool
+	actualSize int
+	connCh     chan net.Conn
+	stopCh     chan *sync.WaitGroup
 }
 
-// Start starts the pool, filling it to the MinSize and maintaining the
+// Start starts the pool, filling it to the MinSize and maintaining fresh
 // connections.
 func (p *Pool) Start() {
+	p.runMutex.Lock()
+	defer p.runMutex.Unlock()
+
+	p.log = golog.LoggerFor("connpool")
+
+	if p.running {
+		p.log.Trace("Already running, ignoring additional Start() call")
+		return
+	}
+
+	p.log.Trace("Starting connection pool")
 	if p.ClaimTimeout == 0 {
+		p.log.Tracef("Defaulting ClaimTimeout to %s", DefaultClaimTimeout)
 		p.ClaimTimeout = DefaultClaimTimeout
 	}
-	p.conns = make([]*pooledConn, 0)
-	if p.MinSize > 0 {
-		// If we're actually pooling stuff, periodically call maintain to
-		// maintain the pool.
-		go func() {
-			for {
-				if p.maintain() {
-					// We've stopped, exit loop
-					return
-				}
-				time.Sleep(1 * time.Second)
-			}
-		}()
+
+	p.connCh = make(chan net.Conn)
+	p.stopCh = make(chan *sync.WaitGroup, p.MinSize)
+
+	p.log.Tracef("Remembering actual size %d in case MinSize is later changed", p.MinSize)
+	p.actualSize = p.MinSize
+	for i := 0; i < p.actualSize; i++ {
+		go p.feedConn()
 	}
+
+	p.running = true
 }
 
+// Stop stops the goroutines that are filling the pool, blocking until they've
+// all terminated.
 func (p *Pool) Stop() {
-	p.mutex.Lock()
-	p.stopped = true
-	p.mutex.Unlock()
+	p.runMutex.Lock()
+	defer p.runMutex.Unlock()
+
+	if !p.running {
+		p.log.Trace("Not running, ignoring Stop() call")
+		return
+	}
+
+	p.log.Trace("Stopping all feedConn goroutines")
+	var wg sync.WaitGroup
+	wg.Add(p.actualSize)
+	for i := 0; i < p.actualSize; i++ {
+		p.stopCh <- &wg
+	}
+	wg.Wait()
+
+	p.running = false
 }
 
 func (p *Pool) Get() (net.Conn, error) {
-	p.mutex.Lock()
-	// Look for an unexpired pooled connection
-	for i, conn := range p.conns {
-		if conn.expires.After(time.Now()) {
-			// Use pooled connection
-			p.removeAt(i)
-			p.doMaintain()
-			p.mutex.Unlock()
-			return conn, nil
-		}
-	}
-
-	// No pooled conn, dial our own
-	p.mutex.Unlock()
-	return p.dial()
-}
-
-// maintain maintains the pool, making sure that connections that are about to
-// time out are replaced with new connections and that connections are sorted
-// based on which are timing out soonest.
-func (p *Pool) maintain() (stopped bool) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	if !p.stopped {
-		p.doMaintain()
-	} else {
-		// Close any lingering connections
-		for _, conn := range p.conns {
-			conn.Close()
-		}
-		p.conns = make([]*pooledConn, 0)
-	}
-	return p.stopped
-}
-
-func (p *Pool) doMaintain() {
-	newConns := make([]*pooledConn, 0)
-	expiresThreshold := time.Now().Add(-1 * TimeoutThreshold)
-	for _, conn := range p.conns {
-		if conn.expires.After(expiresThreshold) {
-			// keep conn
-			newConns = append(newConns, conn)
-		} else {
-			// close expired conn
-			conn.Close()
-		}
-	}
-	sort.Sort(byExpiration(newConns))
-	p.conns = newConns
-
-	// Add connections to get pool up to the MinSize
-	connsNeeded := p.MinSize - len(p.conns)
-	for i := 0; i < connsNeeded; i++ {
-		go func() {
-			for {
-				c, err := p.dial()
-				if err == nil {
-					p.add(c, false)
-					return
-				}
-			}
-		}()
-	}
-}
-
-func (p *Pool) add(conn *pooledConn, maintain bool) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	p.conns = append(p.conns, conn)
-	if maintain {
-		p.doMaintain()
-	}
-}
-
-func (p *Pool) removeAt(i int) {
-	oldConns := p.conns
-	p.conns = make([]*pooledConn, len(oldConns)-1)
-	copy(p.conns, oldConns[:i])
-	copy(p.conns[i:], oldConns[i+1:])
-}
-
-func (p *Pool) dial() (*pooledConn, error) {
-	expires := time.Now().Add(p.ClaimTimeout)
-	c, err := p.Dial()
-	if err != nil {
-		return nil, err
-	} else {
-		conn := &pooledConn{c, expires}
+	p.log.Trace("Getting conn")
+	select {
+	case conn := <-p.connCh:
+		p.log.Trace("Using pooled conn")
 		return conn, nil
+	default:
+		p.log.Trace("No pooled conn, dialing our own")
+		return p.Dial()
 	}
 }
 
-type pooledConn struct {
-	conn    net.Conn
-	expires time.Time
+// feedConn works on continuously feeding the connCh with fresh connections.
+func (p *Pool) feedConn() {
+	newConnTimedOut := time.NewTimer(0)
+
+	for {
+		p.log.Trace("Dialing")
+		conn, err := p.Dial()
+		if err != nil {
+			p.log.Tracef("Error dialing: %s", err)
+			continue
+		}
+		newConnTimedOut.Reset(p.ClaimTimeout)
+
+		select {
+		case p.connCh <- conn:
+			p.log.Trace("Fed conn")
+		case <-newConnTimedOut.C:
+			p.log.Trace("Queued conn timed out, closing")
+			err := conn.Close()
+			if err != nil {
+				p.log.Tracef("Unable to close timed out queued conn: %s", err)
+			}
+		case wg := <-p.stopCh:
+			p.log.Trace("Closing queued conn")
+			err := conn.Close()
+			if err != nil {
+				p.log.Tracef("Unable to close queued conn: %s", err)
+			}
+			(*wg).Done()
+			return
+		}
+	}
 }
-
-func (c *pooledConn) Read(b []byte) (int, error) {
-	return c.conn.Read(b)
-}
-
-// Write implements the method from io.Reader
-func (c *pooledConn) Write(b []byte) (int, error) {
-	return c.conn.Write(b)
-}
-
-func (c *pooledConn) Close() error {
-	return c.conn.Close()
-}
-
-func (c *pooledConn) LocalAddr() net.Addr {
-	return c.conn.LocalAddr()
-}
-
-func (c *pooledConn) RemoteAddr() net.Addr {
-	return c.conn.RemoteAddr()
-}
-
-func (c *pooledConn) SetDeadline(t time.Time) error {
-	return c.conn.SetDeadline(t)
-}
-
-func (c *pooledConn) SetReadDeadline(t time.Time) error {
-	return c.conn.SetReadDeadline(t)
-}
-
-func (c *pooledConn) SetWriteDeadline(t time.Time) error {
-	return c.conn.SetWriteDeadline(t)
-}
-
-type byExpiration []*pooledConn
-
-func (a byExpiration) Len() int           { return len(a) }
-func (a byExpiration) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byExpiration) Less(i, j int) bool { return a[i].expires.Before(a[j].expires) }

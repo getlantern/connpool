@@ -74,15 +74,13 @@ func (p *Pool) Stop() {
 
 func (p *Pool) Get() (net.Conn, error) {
 	p.log.Trace("Getting conn")
-	for {
-		select {
-		case conn := <-p.connCh:
-			p.log.Trace("Using pooled conn")
-			return conn, nil
-		default:
-			p.log.Trace("No pooled conn, dialing our own")
-			return p.Dial()
-		}
+	select {
+	case conn := <-p.connCh:
+		p.log.Trace("Using pooled conn")
+		return conn, nil
+	default:
+		p.log.Trace("No pooled conn, dialing our own")
+		return p.Dial()
 	}
 }
 

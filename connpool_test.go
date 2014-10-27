@@ -40,7 +40,7 @@ func TestIt(t *testing.T) {
 	fdCountStart := countOpenFiles()
 
 	p.Start()
-	// Run another Start() concurrently just to make sure it doesn't much things up
+	// Run another Start() concurrently just to make sure it doesn't muck things up
 	go p.Start()
 
 	time.Sleep(fillTime)

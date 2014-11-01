@@ -11,6 +11,8 @@ import (
 const (
 	DefaultClaimTimeout = 10 * time.Minute
 	TimeoutThreshold    = 1 * time.Second
+	RedialDelayInterval = 50 * time.Millisecond
+	MaxRedialDelay      = 1 * time.Second
 )
 
 type DialFunc func() (net.Conn, error)
@@ -107,33 +109,48 @@ func (p *Pool) Get() (net.Conn, error) {
 // feedConn works on continuously feeding the connCh with fresh connections.
 func (p *Pool) feedConn() {
 	newConnTimedOut := time.NewTimer(0)
+	consecutiveDialFailures := time.Duration(0)
 
 	for {
-		p.log.Trace("Dialing")
-		conn, err := p.Dial()
-		if err != nil {
-			p.log.Tracef("Error dialing: %s", err)
-			continue
-		}
-		newConnTimedOut.Reset(p.ClaimTimeout)
-
 		select {
-		case p.connCh <- conn:
-			p.log.Trace("Fed conn")
-		case <-newConnTimedOut.C:
-			p.log.Trace("Queued conn timed out, closing")
-			err := conn.Close()
-			if err != nil {
-				p.log.Tracef("Unable to close timed out queued conn: %s", err)
-			}
 		case wg := <-p.stopCh:
-			p.log.Trace("Closing queued conn")
-			err := conn.Close()
+			wg.Done()
+		default:
+			p.log.Trace("Dialing")
+			conn, err := p.Dial()
 			if err != nil {
-				p.log.Tracef("Unable to close queued conn: %s", err)
+				p.log.Tracef("Error dialing: %s", err)
+				delay := consecutiveDialFailures * RedialDelayInterval
+				if delay > MaxRedialDelay {
+					delay = MaxRedialDelay
+				}
+				p.log.Tracef("Sleeping %s before dialing again", delay)
+				time.Sleep(delay)
+				consecutiveDialFailures = consecutiveDialFailures + 1
+				continue
 			}
-			(*wg).Done()
-			return
+			p.log.Trace("Dial successful")
+			consecutiveDialFailures = 0
+			newConnTimedOut.Reset(p.ClaimTimeout)
+
+			select {
+			case p.connCh <- conn:
+				p.log.Trace("Fed conn")
+			case <-newConnTimedOut.C:
+				p.log.Trace("Queued conn timed out, closing")
+				err := conn.Close()
+				if err != nil {
+					p.log.Tracef("Unable to close timed out queued conn: %s", err)
+				}
+			case wg := <-p.stopCh:
+				p.log.Trace("Closing queued conn")
+				err := conn.Close()
+				if err != nil {
+					p.log.Tracef("Unable to close queued conn: %s", err)
+				}
+				wg.Done()
+				return
+			}
 		}
 	}
 }

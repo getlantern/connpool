@@ -86,6 +86,41 @@ func TestIt(t *testing.T) {
 	assert.Equal(t, 0, openConns, "After stopping pool, there should be no more open conns")
 }
 
+func TestDialFailure(t *testing.T) {
+	poolSize := 1
+	claimTimeout := 10 * time.Second
+	fail := true
+	dialAttempts := 0
+
+	addr, err := startTestServer()
+	if err != nil {
+		t.Fatalf("Unable to start test server: %s", err)
+	}
+	p := &Pool{
+		MinSize:      poolSize,
+		ClaimTimeout: claimTimeout,
+		Dial: func() (net.Conn, error) {
+			dialAttempts = dialAttempts + 1
+			if fail {
+				return nil, fmt.Errorf("I'm failing!")
+			}
+			return net.DialTimeout("tcp", addr, 15*time.Millisecond)
+		},
+	}
+
+	p.Start()
+	defer p.Stop()
+
+	// Wait for fill to run for a while with a failing connection
+	time.Sleep(2 * time.Second)
+	assert.True(t, dialAttempts < 50, fmt.Sprintf("Should have had a small number of dial attempts, but had %d", dialAttempts))
+
+	// Now make connection succeed and verify that it works
+	fail = false
+	time.Sleep(100 * time.Millisecond)
+	connectAndRead(t, p, 1)
+}
+
 func connectAndRead(t *testing.T, p *Pool, loops int) {
 	for i := 0; i < loops; i++ {
 		c, err := p.Get()

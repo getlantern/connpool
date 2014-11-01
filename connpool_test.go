@@ -20,7 +20,7 @@ var (
 	msg = []byte("HELLO")
 )
 
-func TestIt(t *testing.T) {
+func ddTestIt(t *testing.T) {
 	poolSize := 20
 	claimTimeout := 1 * time.Second
 	fillTime := 100 * time.Millisecond

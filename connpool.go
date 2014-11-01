@@ -114,7 +114,9 @@ func (p *Pool) feedConn() {
 	for {
 		select {
 		case wg := <-p.stopCh:
+			p.log.Trace("Stopped before next dial")
 			wg.Done()
+			return
 		default:
 			p.log.Trace("Dialing")
 			conn, err := p.Dial()

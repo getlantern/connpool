@@ -78,6 +78,9 @@ func TestIt(t *testing.T) {
 	// Make sure we can still get connections and use them
 	connectAndRead(t, p, poolSize)
 
+	// Wait for pool to fill again
+	time.Sleep(fillTime)
+
 	p.Stop()
 	// Run another Stop() concurrently just to make sure it doesn't muck things up
 	go p.Stop()
@@ -88,7 +91,6 @@ func TestIt(t *testing.T) {
 
 func TestDialFailure(t *testing.T) {
 	poolSize := 1
-	claimTimeout := 10 * time.Second
 	fail := true
 	dialAttempts := 0
 
@@ -97,8 +99,7 @@ func TestDialFailure(t *testing.T) {
 		t.Fatalf("Unable to start test server: %s", err)
 	}
 	p := &Pool{
-		MinSize:      poolSize,
-		ClaimTimeout: claimTimeout,
+		MinSize: poolSize,
 		Dial: func() (net.Conn, error) {
 			dialAttempts = dialAttempts + 1
 			if fail {
@@ -112,8 +113,8 @@ func TestDialFailure(t *testing.T) {
 	defer p.Stop()
 
 	// Wait for fill to run for a while with a failing connection
-	time.Sleep(2 * time.Second)
-	assert.True(t, dialAttempts < 50, fmt.Sprintf("Should have had a small number of dial attempts, but had %d", dialAttempts))
+	time.Sleep(5 * time.Second)
+	assert.True(t, dialAttempts < 100, fmt.Sprintf("Should have had a small number of dial attempts, but had %d", dialAttempts))
 
 	// Now make connection succeed and verify that it works
 	fail = false

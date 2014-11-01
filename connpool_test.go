@@ -90,7 +90,6 @@ func TestIt(t *testing.T) {
 }
 
 func TestDialFailure(t *testing.T) {
-	poolSize := 1
 	fail := true
 	dialAttempts := 0
 
@@ -99,7 +98,9 @@ func TestDialFailure(t *testing.T) {
 		t.Fatalf("Unable to start test server: %s", err)
 	}
 	p := &Pool{
-		MinSize: poolSize,
+		MinSize:              10,
+		RedialDelayIncrement: 10 * time.Millisecond,
+		MaxRedialDelay:       100 * time.Millisecond,
 		Dial: func() (net.Conn, error) {
 			dialAttempts = dialAttempts + 1
 			if fail {
@@ -113,8 +114,8 @@ func TestDialFailure(t *testing.T) {
 	defer p.Stop()
 
 	// Wait for fill to run for a while with a failing connection
-	time.Sleep(5 * time.Second)
-	assert.True(t, dialAttempts < 100, fmt.Sprintf("Should have had a small number of dial attempts, but had %d", dialAttempts))
+	time.Sleep(1 * time.Second)
+	assert.True(t, dialAttempts < 500, fmt.Sprintf("Should have had a small number of dial attempts, but had %d", dialAttempts))
 
 	// Now make connection succeed and verify that it works
 	fail = false

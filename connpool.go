@@ -9,10 +9,9 @@ import (
 )
 
 const (
-	DefaultClaimTimeout = 10 * time.Minute
-	TimeoutThreshold    = 1 * time.Second
-	RedialDelayInterval = 50 * time.Millisecond
-	MaxRedialDelay      = 1 * time.Second
+	DefaultClaimTimeout         = 10 * time.Minute
+	DefaultRedialDelayIncrement = 50 * time.Millisecond
+	DefaultMaxRedialDelay       = 1 * time.Second
 )
 
 type DialFunc func() (net.Conn, error)
@@ -29,6 +28,13 @@ type Pool struct {
 	// ClaimTimeout: connections will be removed from pool if unclaimed for
 	// longer than ClaimTimeout.  The default ClaimTimeout is 10 minutes.
 	ClaimTimeout time.Duration
+
+	// RedialDelayIncrement: amount by which to increase the redial delay with
+	// each consecutive dial failure.
+	RedialDelayIncrement time.Duration
+
+	// MaxRedialDelay: the maximum amount of time to wait before redialing.
+	MaxRedialDelay time.Duration
 
 	// Dial: specifies the function used to create new connections
 	Dial DialFunc
@@ -58,6 +64,14 @@ func (p *Pool) Start() {
 	if p.ClaimTimeout == 0 {
 		p.log.Tracef("Defaulting ClaimTimeout to %s", DefaultClaimTimeout)
 		p.ClaimTimeout = DefaultClaimTimeout
+	}
+	if p.RedialDelayIncrement == 0 {
+		p.log.Tracef("Defaulting p.RedialDelayIncrement to %s", DefaultRedialDelayIncrement)
+		p.RedialDelayIncrement = DefaultRedialDelayIncrement
+	}
+	if p.MaxRedialDelay == 0 {
+		p.log.Tracef("Defaulting p.MaxRedialDelay to %s", DefaultMaxRedialDelay)
+		p.MaxRedialDelay = DefaultMaxRedialDelay
 	}
 
 	p.connCh = make(chan net.Conn)
@@ -122,9 +136,9 @@ func (p *Pool) feedConn() {
 			conn, err := p.Dial()
 			if err != nil {
 				p.log.Tracef("Error dialing: %s", err)
-				delay := consecutiveDialFailures * RedialDelayInterval
-				if delay > MaxRedialDelay {
-					delay = MaxRedialDelay
+				delay := consecutiveDialFailures * p.RedialDelayIncrement
+				if delay > p.MaxRedialDelay {
+					delay = p.MaxRedialDelay
 				}
 				p.log.Tracef("Sleeping %s before dialing again", delay)
 				time.Sleep(delay)

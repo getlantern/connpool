@@ -119,6 +119,11 @@ func TestDialFailure(t *testing.T) {
 	fail = false
 	time.Sleep(100 * time.Millisecond)
 	connectAndRead(t, p, 1)
+
+	// Now make the connection fail again so that when we stop, we're stopping
+	// while failing (tests a different code path for stopping)
+	fail = true
+	time.Sleep(100 * time.Millisecond)
 }
 
 func connectAndRead(t *testing.T, p *Pool, loops int) {

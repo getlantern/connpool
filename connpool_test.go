@@ -37,7 +37,7 @@ func TestIt(t *testing.T) {
 		},
 	}
 
-	fdCountStart := countOpenFiles()
+	fdCountStart := countTCPFiles()
 
 	p.Start()
 	// Run another Start() concurrently just to make sure it doesn't muck things up
@@ -45,14 +45,14 @@ func TestIt(t *testing.T) {
 
 	time.Sleep(fillTime)
 
-	openConns := countOpenFiles() - fdCountStart
+	openConns := countTCPFiles() - fdCountStart
 	assert.Equal(t, poolSize, openConns, "Pool should initially open the right number of conns")
 
 	// Use more than the pooled connections
 	connectAndRead(t, p, poolSize*2)
 
 	time.Sleep(fillTime)
-	openConns = countOpenFiles() - fdCountStart
+	openConns = countTCPFiles() - fdCountStart
 	assert.Equal(t, poolSize, openConns, "Pool should fill itself back up to the right number of conns")
 
 	// Wait for connections to time out
@@ -62,7 +62,7 @@ func TestIt(t *testing.T) {
 	connectAndRead(t, p, poolSize*2)
 
 	time.Sleep(fillTime)
-	openConns = countOpenFiles() - fdCountStart
+	openConns = countTCPFiles() - fdCountStart
 	assert.Equal(t, poolSize, openConns, "After pooled conns time out, pool should fill itself back up to the right number of conns")
 
 	// Make a dial function that randomly returns closed connections
@@ -85,7 +85,7 @@ func TestIt(t *testing.T) {
 	// Run another Stop() concurrently just to make sure it doesn't muck things up
 	go p.Stop()
 
-	openConns = countOpenFiles() - fdCountStart
+	openConns = countTCPFiles() - fdCountStart
 	assert.Equal(t, 0, openConns, "After stopping pool, there should be no more open conns")
 }
 
@@ -169,10 +169,10 @@ func startTestServer() (string, error) {
 }
 
 // see https://groups.google.com/forum/#!topic/golang-nuts/c0AnWXjzNIA
-func countOpenFiles() int {
+func countTCPFiles() int {
 	out, err := exec.Command("lsof", "-p", fmt.Sprintf("%v", os.Getpid())).Output()
 	if err != nil {
 		log.Fatal(err)
 	}
-	return bytes.Count(out, []byte("\n")) - 1
+	return bytes.Count(out, []byte("TCP")) - 1
 }

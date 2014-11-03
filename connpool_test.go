@@ -37,7 +37,7 @@ func TestIt(t *testing.T) {
 		},
 	}
 
-	fdCountStart := countOpenFiles()
+	fdCountStart := countTCPFiles()
 
 	p.Start()
 	// Run another Start() concurrently just to make sure it doesn't muck things up
@@ -45,14 +45,14 @@ func TestIt(t *testing.T) {
 
 	time.Sleep(fillTime)
 
-	openConns := countOpenFiles() - fdCountStart
+	openConns := countTCPFiles() - fdCountStart
 	assert.Equal(t, poolSize, openConns, "Pool should initially open the right number of conns")
 
 	// Use more than the pooled connections
 	connectAndRead(t, p, poolSize*2)
 
 	time.Sleep(fillTime)
-	openConns = countOpenFiles() - fdCountStart
+	openConns = countTCPFiles() - fdCountStart
 	assert.Equal(t, poolSize, openConns, "Pool should fill itself back up to the right number of conns")
 
 	// Wait for connections to time out
@@ -62,7 +62,7 @@ func TestIt(t *testing.T) {
 	connectAndRead(t, p, poolSize*2)
 
 	time.Sleep(fillTime)
-	openConns = countOpenFiles() - fdCountStart
+	openConns = countTCPFiles() - fdCountStart
 	assert.Equal(t, poolSize, openConns, "After pooled conns time out, pool should fill itself back up to the right number of conns")
 
 	// Make a dial function that randomly returns closed connections
@@ -78,12 +78,54 @@ func TestIt(t *testing.T) {
 	// Make sure we can still get connections and use them
 	connectAndRead(t, p, poolSize)
 
+	// Wait for pool to fill again
+	time.Sleep(fillTime)
+
 	p.Stop()
 	// Run another Stop() concurrently just to make sure it doesn't muck things up
 	go p.Stop()
 
-	openConns = countOpenFiles() - fdCountStart
+	openConns = countTCPFiles() - fdCountStart
 	assert.Equal(t, 0, openConns, "After stopping pool, there should be no more open conns")
+}
+
+func TestDialFailure(t *testing.T) {
+	fail := true
+	dialAttempts := 0
+
+	addr, err := startTestServer()
+	if err != nil {
+		t.Fatalf("Unable to start test server: %s", err)
+	}
+	p := &Pool{
+		MinSize:              10,
+		RedialDelayIncrement: 10 * time.Millisecond,
+		MaxRedialDelay:       100 * time.Millisecond,
+		Dial: func() (net.Conn, error) {
+			dialAttempts = dialAttempts + 1
+			if fail {
+				return nil, fmt.Errorf("I'm failing!")
+			}
+			return net.DialTimeout("tcp", addr, 15*time.Millisecond)
+		},
+	}
+
+	p.Start()
+	defer p.Stop()
+
+	// Wait for fill to run for a while with a failing connection
+	time.Sleep(1 * time.Second)
+	assert.True(t, dialAttempts < 500, fmt.Sprintf("Should have had a small number of dial attempts, but had %d", dialAttempts))
+
+	// Now make connection succeed and verify that it works
+	fail = false
+	time.Sleep(100 * time.Millisecond)
+	connectAndRead(t, p, 1)
+
+	// Now make the connection fail again so that when we stop, we're stopping
+	// while failing (tests a different code path for stopping)
+	fail = true
+	time.Sleep(100 * time.Millisecond)
 }
 
 func connectAndRead(t *testing.T, p *Pool, loops int) {
@@ -127,10 +169,10 @@ func startTestServer() (string, error) {
 }
 
 // see https://groups.google.com/forum/#!topic/golang-nuts/c0AnWXjzNIA
-func countOpenFiles() int {
+func countTCPFiles() int {
 	out, err := exec.Command("lsof", "-p", fmt.Sprintf("%v", os.Getpid())).Output()
 	if err != nil {
 		log.Fatal(err)
 	}
-	return bytes.Count(out, []byte("\n")) - 1
+	return bytes.Count(out, []byte("TCP")) - 1
 }

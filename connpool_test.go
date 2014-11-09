@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"math/rand"
 	"net"
 	"os"
 	"os/exec"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,8 +90,8 @@ func TestIt(t *testing.T) {
 }
 
 func TestDialFailure(t *testing.T) {
-	fail := true
-	dialAttempts := 0
+	fail := int32(1)
+	dialAttempts := int32(0)
 
 	addr, err := startTestServer()
 	if err != nil {
@@ -102,8 +102,8 @@ func TestDialFailure(t *testing.T) {
 		RedialDelayIncrement: 10 * time.Millisecond,
 		MaxRedialDelay:       100 * time.Millisecond,
 		Dial: func() (net.Conn, error) {
-			dialAttempts = dialAttempts + 1
-			if fail {
+			atomic.AddInt32(&dialAttempts, 1)
+			if fail == int32(1) {
 				return nil, fmt.Errorf("I'm failing!")
 			}
 			return net.DialTimeout("tcp", addr, 15*time.Millisecond)
@@ -118,13 +118,13 @@ func TestDialFailure(t *testing.T) {
 	assert.True(t, dialAttempts < 500, fmt.Sprintf("Should have had a small number of dial attempts, but had %d", dialAttempts))
 
 	// Now make connection succeed and verify that it works
-	fail = false
+	atomic.StoreInt32(&fail, 0)
 	time.Sleep(100 * time.Millisecond)
 	connectAndRead(t, p, 1)
 
 	// Now make the connection fail again so that when we stop, we're stopping
 	// while failing (tests a different code path for stopping)
-	fail = true
+	atomic.StoreInt32(&fail, 1)
 	time.Sleep(100 * time.Millisecond)
 }
 
